@@ -1,0 +1,13 @@
+HTTP/1.1 200 OK
+date: Tue, 25 Aug 2026 10:07:52 GMT
+server: uvicorn
+content-disposition: attachment; filename="biz_rgn_20260725T000000_20260726T000000.csv"
+x-yard-id: biz_rgn
+x-exported-row-count: 53
+x-local-start: 2026-07-25T00:00:00
+x-local-end: 2026-07-26T00:00:00
+x-utc-start: 2026-07-25T06:00:00+00:00
+x-utc-end: 2026-07-26T06:00:00+00:00
+content-type: text/csv; charset=utf-8
+transfer-encoding: chunked
+

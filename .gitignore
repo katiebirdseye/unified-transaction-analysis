@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+.vscode/
+.idea/
+*.log
+output/
+credentials.json
+service-account.json
+.env
+*.json
+credentials/

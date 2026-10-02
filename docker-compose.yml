@@ -1,0 +1,19 @@
+services:
+  unified-transaction-analysis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: unified-transaction-analysis
+
+    restart: unless-stopped
+
+    ports:
+      - "8012:8012"
+
+    env_file:
+      - .env
+
+    volumes:
+      - /central_logs:/central_logs:ro
+      - ./credentials.json:/app/credentials.json:ro
