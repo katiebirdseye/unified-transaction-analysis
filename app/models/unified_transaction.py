@@ -42,6 +42,7 @@ class UnifiedTransaction:
 
     # Identity
     yard_id: str
+    # Container-log identity only; never an AIQ external_uuid.
     uuid: Optional[str] = None
     ground_truth_transaction_id: Optional[str] = None
     ground_truth_lookup_yard_id: Optional[str] = None
@@ -90,12 +91,25 @@ class UnifiedTransaction:
         default_factory=list
     )
 
+    container_logs_gate_names: list[str] = field(default_factory=list)
+    container_logs_remote_gate_ids: list[str] = field(default_factory=list)
+    container_logs_fusion_center_ids: list[str] = field(default_factory=list)
+
     container_logs_event_types: list[str] = field(
         default_factory=list
     )
 
     flags: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    # Collector-owned observation, excluded from CSV/legacy JSON and equality.
+    _retained_aiq_fields: dict[str, Any] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
+    _decision_raw_fields: dict[str, Any] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def add_flag(self, flag: str) -> None:
         cleaned = flag.strip()
@@ -125,4 +139,5 @@ class UnifiedTransaction:
         return {
             key: serialize(value)
             for key, value in asdict(self).items()
+            if key not in ("_retained_aiq_fields", "_decision_raw_fields")
         }

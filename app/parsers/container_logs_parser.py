@@ -46,6 +46,10 @@ class ContainerLogValues:
     directions: list[str] = field(default_factory=list)
     gate_ids: list[str] = field(default_factory=list)
     orientations: list[str] = field(default_factory=list)
+    # Separate transaction names and remote API IDs from legacy gate_ids.
+    gate_names: list[str] = field(default_factory=list)
+    remote_gate_ids: list[str] = field(default_factory=list)
+    fusion_center_ids: list[str] = field(default_factory=list)
 
     first_timestamp_utc: Optional[datetime] = None
     last_timestamp_utc: Optional[datetime] = None
@@ -79,6 +83,9 @@ class ContainerLogValues:
             "directions": self.directions,
             "gate_ids": self.gate_ids,
             "orientations": self.orientations,
+            "gate_names": self.gate_names,
+            "remote_gate_ids": self.remote_gate_ids,
+            "fusion_center_ids": self.fusion_center_ids,
             "first_timestamp_utc": (
                 self.first_timestamp_utc.isoformat()
                 if self.first_timestamp_utc
@@ -172,6 +179,7 @@ class ContainerLogsParser:
             Dictionary keyed by UUID.
         """
 
+        self.read_succeeded = False
         if not os.path.exists(self.log_file_path):
             logging.warning(
                 "Container log file does not exist: %s",
@@ -201,16 +209,26 @@ class ContainerLogsParser:
                 timestamp_utc, payload = parsed_line
 
                 uuid = self._extract_uuid(payload)
+                if uuid:
+                    gate_identity = self._extract_gate_identity(payload)
+                    if any(gate_identity.values()):
+                        record = grouped.setdefault(uuid, ContainerLogValues(uuid=uuid))
+                        for name, values in gate_identity.items():
+                            for value in values:
+                                self.value_helper.add_unique_raw_value(getattr(record, name), value)
 
-                # Store alert metadata for later OCR records.
+                # Ordinary alerts remain fallback metadata for later OCR.
+                # Canonical confirmation metadata is retained independently.
                 if self._is_alert_event(payload):
                     if uuid:
-                        alert_metadata_by_uuid[uuid] = (
-                            self._extract_alert_metadata(
-                                payload=payload,
-                                timestamp_utc=timestamp_utc,
-                            )
+                        alert_metadata = self._extract_alert_metadata(
+                            payload=payload,
+                            timestamp_utc=timestamp_utc,
                         )
+                        alert_metadata_by_uuid[uuid] = alert_metadata
+                        if self._is_confirmation_alert(payload):
+                            record = grouped.setdefault(uuid, ContainerLogValues(uuid=uuid))
+                            self._apply_confirmation_alert(record, alert_metadata)
 
                     continue
 
@@ -360,6 +378,7 @@ class ContainerLogsParser:
             grouped
         )
 
+        self.read_succeeded = True
         return grouped
 
     def parse_as_list(self) -> list[ContainerLogValues]:
@@ -559,6 +578,14 @@ class ContainerLogsParser:
         ).strip().upper()
 
         return event == "ALERT"
+
+    @staticmethod
+    def _is_confirmation_alert(payload: dict[str, Any]) -> bool:
+        return (
+            ContainerLogsParser._is_alert_event(payload)
+            and str(payload.get("message") or "").strip().casefold()
+            == "sending confirmation alert"
+        )
 
     # ------------------------------------------------------------------
     # Gemini OCR
@@ -956,6 +983,42 @@ class ContainerLogsParser:
     # Metadata
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _extract_gate_identity(payload: dict[str, Any]) -> dict[str, list[str]]:
+        result = {"gate_names": [], "remote_gate_ids": [], "fusion_center_ids": []}
+        for key, target in (("gate_name", "gate_names"), ("fusion_center_id", "fusion_center_ids")):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                result[target].append(value)
+
+        # Only a UUID-associated caller can attach these response IDs. Local
+        # gate_id values never enter this namespace, even if they are numeric.
+        status = str(payload.get("response_status") or "").strip()
+        if (payload.get("dispatch_succeeded") is not True
+                or not status.isdigit() or not 200 <= int(status) < 300):
+            return result
+        response = payload.get("response_text")
+        if isinstance(response, str):
+            try:
+                response = json.loads(response)
+            except (ValueError, TypeError):
+                return result
+        if not isinstance(response, dict):
+            return result
+        values = [response.get("gate_id")]
+        if isinstance(response.get("gate_ids"), list):
+            values.extend(response["gate_ids"])
+        for value in values:
+            # Numeric identifiers are normalized strings; bools, floats and
+            # name-like IDs are not authoritative numeric gate IDs.
+            if isinstance(value, (int, str)) and not isinstance(value, bool):
+                cleaned = str(value).strip()
+                if cleaned.isascii() and cleaned.isdigit():
+                    normalized = str(int(cleaned))
+                    if normalized not in result["remote_gate_ids"]:
+                        result["remote_gate_ids"].append(normalized)
+        return result
+
     def _add_common_metadata(
         self,
         record: ContainerLogValues,
@@ -1024,6 +1087,23 @@ class ContainerLogsParser:
                 )
             ),
         }
+
+    def _apply_confirmation_alert(
+        self,
+        record: ContainerLogValues,
+        metadata: dict[str, Any],
+    ) -> None:
+        # Keep the first confirmation snapshot intact, independent of later
+        # generic alerts. All confirmation times still enter the collection.
+        if "confirmation_alert_timestamp_utc" not in record.metadata:
+            record.metadata.update({
+                "confirmation_alert_timestamp_utc": metadata["timestamp_utc"],
+                "confirmation_alert_orientation": metadata.get("orientation"),
+                "confirmation_alert_gate_id": metadata.get("gate_id"),
+                "confirmation_alert_direction": metadata.get("direction"),
+            })
+        self._add_timestamp(record, metadata["timestamp_utc"])
+        self._apply_alert_metadata(record, metadata)
 
     def _apply_alert_metadata(
         self,

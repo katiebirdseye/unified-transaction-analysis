@@ -107,6 +107,9 @@ class AnalysisResult:
     aiq_error: Optional[str] = None
     archive_error: Optional[str] = None
 
+    # Basic pipeline completion, not retention/coverage certification.
+    decision_analysis_complete: bool = False
+
     def to_dict(self) -> dict:
         return {
             "yard_id": self.yard_id,
@@ -230,7 +233,7 @@ class AnalysisService:
             )
         )
 
-        container_logs_by_uuid = (
+        container_logs_by_uuid, container_read_succeeded = (
             self._load_container_log_values(
                 yard_id=yard_id,
                 start_utc=start_utc,
@@ -252,6 +255,7 @@ class AnalysisService:
             include_container_logs_only=(
                 request.include_container_logs_only
             ),
+            competitive_aiq=True,
         )
 
         result = self._build_result(
@@ -263,6 +267,9 @@ class AnalysisService:
             ),
             transactions=transactions,
         )
+
+        result.decision_analysis_complete = (container_read_succeeded
+            and not result.aiq_error and not result.archive_error)
 
         logging.info(
             "Completed unified analysis for yard %s: "
@@ -320,6 +327,7 @@ class AnalysisService:
             ContainerLogValues,
         ],
         include_container_logs_only: bool,
+        competitive_aiq: bool = False,
     ) -> list[UnifiedTransaction]:
         """
         Run matching with a request-specific matcher configuration.
@@ -353,7 +361,71 @@ class AnalysisService:
             ),
             container_logs_by_uuid=container_logs_by_uuid,
             yard_id=yard_id,
+            competitive_aiq=competitive_aiq,
         )
+
+    def _load_ticket_competition(
+        self, source: UnifiedTransaction,
+    ) -> tuple[list[UnifiedTransaction], dict[str, ContainerLogValues], bool]:
+        """Acquire the connected AIQ/container candidate component of a ticket.
+
+        A contender may sit two thresholds from the requested AIQ timestamp.
+        Following candidate edges also includes alternatives for contenders,
+        so day boundaries or a fixed request window cannot hide a nearer pair.
+        The yard file is parsed once; only connected records enter assignment.
+        """
+        provider = self.ground_truth_selector.aiq_provider
+        lookup = getattr(provider, "get_transactions_for_matching", None)
+        if lookup is None:
+            raise ValueError("AIQ competition lookup unavailable")
+        all_logs, read_complete = self._load_container_log_values(
+            yard_id=source.yard_id,
+            start_utc=datetime.min.replace(tzinfo=timezone.utc),
+            end_utc=datetime.max.replace(tzinfo=timezone.utc),
+            normalized_deduplication=False,
+        )
+        matcher = self.transaction_matcher
+        horizon = timedelta(seconds=matcher.config.archive_time_threshold_seconds)
+        selected_rows = {source.ground_truth_transaction_id: source}
+        selected_logs: dict[str, ContainerLogValues] = {}
+        frontier = [source]
+        while frontier:
+            discovered = {}
+            for transaction in frontier:
+                for _, _, uuid, values, _ in matcher._get_aiq_candidates(
+                    transaction=transaction, container_logs_by_uuid=all_logs, yard_id=source.yard_id,
+                ):
+                    if uuid not in selected_logs:
+                        discovered[uuid] = values
+            if not discovered:
+                break
+            selected_logs.update(discovered)
+            stamps = [self._ensure_utc(matcher._get_container_reference_timestamp(values))
+                      for values in selected_logs.values()]
+            start, end = min(stamps) - horizon, max(stamps) + horizon + timedelta(microseconds=1)
+            neighbors = lookup(yard_id=source.yard_id, start_utc=start, end_utc=end)
+            frontier = []
+            seen = set()
+            for transaction in neighbors:
+                identity = transaction.ground_truth_transaction_id
+                if not identity or transaction.timestamp_utc is None:
+                    raise ValueError("AIQ competitor lacks identity or timestamp")
+                if identity in seen:
+                    raise ValueError("AIQ competition lookup returned duplicate identities")
+                seen.add(identity)
+                if (transaction.yard_id != source.yard_id
+                        or transaction.ground_truth_source != source.ground_truth_source
+                        or not start <= self._ensure_utc(transaction.timestamp_utc) < end):
+                    continue
+                # The exact-ID row remains authoritative for the requested ID.
+                if identity in selected_rows:
+                    continue
+                if matcher._get_aiq_candidates(transaction=transaction,
+                        container_logs_by_uuid=selected_logs, yard_id=source.yard_id):
+                    selected_rows[identity] = transaction
+                    frontier.append(transaction)
+        return list(selected_rows.values()), selected_logs, read_complete
+
     # ------------------------------------------------------------------
     # Container logs
     # ------------------------------------------------------------------
@@ -365,7 +437,7 @@ class AnalysisService:
         start_utc: datetime,
         end_utc: datetime,
         normalized_deduplication: bool,
-    ) -> dict[str, ContainerLogValues]:
+    ) -> tuple[dict[str, ContainerLogValues], bool]:
         log_file_path = os.path.join(
             self.container_logs_dir,
             yard_id,
@@ -381,11 +453,9 @@ class AnalysisService:
 
         parsed = parser.parse()
 
-        return self._filter_container_logs_by_time(
-            container_logs_by_uuid=parsed,
-            start_utc=start_utc,
-            end_utc=end_utc,
-        )
+        return (self._filter_container_logs_by_time(
+            container_logs_by_uuid=parsed, start_utc=start_utc, end_utc=end_utc),
+            getattr(parser, "read_succeeded", False))
 
     def _build_parser(
         self,

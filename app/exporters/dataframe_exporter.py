@@ -54,6 +54,9 @@ class DataFrameExporter:
 
         "Container Logs Event Types",
         "Flags",
+        "Container Logs Gate Names",
+        "Container Logs Remote Gate IDs",
+        "Container Logs Fusion Center IDs",
     ]
 
     def __init__(
@@ -144,7 +147,8 @@ class DataFrameExporter:
                 transaction.transaction_match_status
             ),
             "Match Method": self._format_match_method(
-                transaction.match_method
+                transaction.match_method,
+                transaction.ground_truth_source,
             ),
             "Match Time Difference Seconds": self._format_number(
                 transaction.match_time_difference_seconds
@@ -233,6 +237,9 @@ class DataFrameExporter:
             "Flags": self._format_values(
                 transaction.flags
             ),
+            "Container Logs Gate Names": self._format_values(transaction.container_logs_gate_names),
+            "Container Logs Remote Gate IDs": self._format_values(transaction.container_logs_remote_gate_ids),
+            "Container Logs Fusion Center IDs": self._format_values(transaction.container_logs_fusion_center_ids),
         }
 
         if self.include_metadata:
@@ -467,32 +474,30 @@ class DataFrameExporter:
     @staticmethod
     def _format_match_method(
         value: Any,
+        ground_truth_source: Any,
     ) -> str:
-        """
-        Convert internal matching methods into report-friendly labels.
-        """
-
+        """Label correlation provenance using both source and matching method."""
         if value is None:
             return ""
 
-        if isinstance(value, Enum):
-            cleaned = str(value.value)
-        else:
-            cleaned = str(value)
+        cleaned = DataFrameExporter._enum_value(value).strip().upper()
+        source = DataFrameExporter._enum_value(ground_truth_source).strip().upper()
 
-        cleaned = cleaned.strip().upper()
+        if cleaned == "NONE":
+            return "NONE"
 
-        if cleaned == "UUID":
+        if source == "AIQ" and cleaned in {
+            "UUID",
+            "TIMESTAMP_DIRECTION",
+            "TIMESTAMP_DIRECTION_GATE",
+        }:
             return "CONTAINER_LOGS -> AIQ"
 
-        if cleaned in {
+        if source == "ARCHIVE" and cleaned in {
             "TIMESTAMP_DIRECTION",
             "TIMESTAMP_DIRECTION_GATE",
         }:
             return "CONTAINER_LOGS -> ARCHIVE"
-
-        if cleaned == "NONE":
-            return "NONE"
 
         return cleaned
 

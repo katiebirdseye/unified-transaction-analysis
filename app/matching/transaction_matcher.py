@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from math import isclose
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -22,14 +23,14 @@ class TransactionMatcherConfig:
 
     archive_time_threshold_seconds:
         Maximum timestamp difference allowed when matching Archive ground
-        truth to a container-log UUID.
+        truth (and AIQ) to a container-log UUID.
 
     require_direction_for_archive:
         When True, Archive and container-log directions must match whenever
         both are available.
 
     prefer_gate_match:
-        Prefer candidates with a matching gate when gate data exists.
+        Prefer Archive candidates with a matching gate when gate data exists.
 
     include_container_logs_only:
         Add rows for container-log UUIDs that did not match any selected
@@ -49,7 +50,9 @@ class TransactionMatcher:
     Matching rules:
 
     AIQ:
-        Match directly by UUID.
+        Match the uniquely nearest candidate by yard, timestamp and direction.
+        Nearest-time ties are ambiguous; AIQ UUIDs are ignored.
+        Available explicit gate names and remote numeric gate IDs must agree.
 
     Archive:
         Match by nearest timestamp within the configured threshold.
@@ -76,12 +79,14 @@ class TransactionMatcher:
         ground_truth_transactions: Sequence[UnifiedTransaction],
         container_logs_by_uuid: dict[str, ContainerLogValues],
         yard_id: Optional[str] = None,
+        competitive_aiq: bool = False,
     ) -> list[UnifiedTransaction]:
         """
         Match selected ground truth against grouped container-log records.
 
         Returns a new list of UnifiedTransaction objects. The input ground
         truth objects are copied before container-log data is attached.
+        competitive_aiq enables global one-to-one assignment for ticket scope.
         """
 
         transactions = [
@@ -125,6 +130,8 @@ class TransactionMatcher:
         matched_rows.extend(
             self._match_aiq_transactions(
                 transactions=aiq_transactions,
+                yard_id=yard_id,
+                competitive=competitive_aiq,
                 container_logs_by_uuid=normalized_logs,
                 used_container_log_uuids=used_container_log_uuids,
             )
@@ -167,57 +174,142 @@ class TransactionMatcher:
         transactions: Sequence[UnifiedTransaction],
         container_logs_by_uuid: dict[str, ContainerLogValues],
         used_container_log_uuids: set[str],
+        yard_id: Optional[str],
+        competitive: bool = False,
     ) -> list[UnifiedTransaction]:
+        if competitive:
+            return self._match_aiq_competitively(
+                transactions=transactions, container_logs_by_uuid=container_logs_by_uuid,
+                used_container_log_uuids=used_container_log_uuids, yard_id=yard_id,
+            )
         rows: list[UnifiedTransaction] = []
 
         for transaction in transactions:
-            uuid = self._clean_string(transaction.uuid)
-
-            if not uuid:
-                transaction.transaction_match_status = (
-                    TransactionMatchStatus.GROUND_TRUTH_ONLY
-                )
-                transaction.match_method = MatchMethod.NONE
-                transaction.add_flag("AIQ_UUID_MISSING")
-                rows.append(transaction)
-                continue
-
-            log_values = container_logs_by_uuid.get(uuid)
-
-            if log_values is None:
-                transaction.transaction_match_status = (
-                    TransactionMatchStatus.GROUND_TRUTH_ONLY
-                )
-                transaction.match_method = MatchMethod.UUID
-                transaction.add_flag(
-                    "NO_CONTAINER_LOGS_FOUND_FOR_AIQ_UUID"
-                )
-                rows.append(transaction)
-                continue
-
-            self._attach_container_log_values(
+            # AIQ and container identities belong to separate namespaces.
+            transaction.uuid = None
+            transaction.match_method = MatchMethod.NONE
+            transaction.match_time_difference_seconds = None
+            candidates = self._get_aiq_candidates(
                 transaction=transaction,
-                log_values=log_values,
+                container_logs_by_uuid=container_logs_by_uuid,
+                yard_id=yard_id,
             )
-
-            transaction.transaction_match_status = (
-                TransactionMatchStatus.MATCHED
-            )
-            transaction.match_method = MatchMethod.UUID
-
-            transaction.match_time_difference_seconds = (
-                self._calculate_time_difference_seconds(
-                    transaction.timestamp_utc,
-                    self._get_container_reference_timestamp(
-                        log_values
-                    ),
+            if not candidates:
+                transaction.transaction_match_status = TransactionMatchStatus.GROUND_TRUTH_ONLY
+                transaction.add_flag("NO_CONTAINER_LOGS_MATCH_FOR_AIQ_TRANSACTION")
+            else:
+                candidates.sort(key=lambda candidate: candidate[1])
+                # Datetimes resolve to microseconds. Treat differences within
+                # that precision as tied, without UUID or gate tie-breakers.
+                nearest_is_tied = len(candidates) > 1 and isclose(
+                    candidates[0][1], candidates[1][1], rel_tol=0.0, abs_tol=1e-6,
                 )
-            )
-
-            used_container_log_uuids.add(uuid)
+                if nearest_is_tied:
+                    transaction.transaction_match_status = TransactionMatchStatus.AMBIGUOUS
+                    transaction.add_flag("AMBIGUOUS_AIQ_CONTAINER_LOG_MATCH")
+                    rows.append(transaction)
+                    continue
+                _, difference, uuid, values, method = candidates[0]
+                transaction.uuid = values.uuid
+                self._attach_container_log_values(transaction=transaction, log_values=values)
+                transaction.transaction_match_status = TransactionMatchStatus.MATCHED
+                transaction.match_method = method
+                transaction.match_time_difference_seconds = difference
+                used_container_log_uuids.add(uuid)
             rows.append(transaction)
 
         return rows
+
+    def _get_aiq_candidates(
+        self,
+        *,
+        transaction: UnifiedTransaction,
+        container_logs_by_uuid: dict[str, ContainerLogValues],
+        yard_id: Optional[str],
+    ) -> list[tuple[int, float, str, ContainerLogValues, MatchMethod]]:
+        scoped_logs = {
+            uuid: values for uuid, values in container_logs_by_uuid.items()
+            if (self._extract_yard_id_from_metadata(values)
+                or self._clean_string(yard_id)) == transaction.yard_id
+        }
+        return self._find_time_candidates(
+            transaction=transaction, container_logs_by_uuid=scoped_logs, aiq_matching=True,
+        )
+
+    def _match_aiq_competitively(
+        self,
+        *,
+        transactions: Sequence[UnifiedTransaction],
+        container_logs_by_uuid: dict[str, ContainerLogValues],
+        used_container_log_uuids: set[str],
+        yard_id: Optional[str],
+    ) -> list[UnifiedTransaction]:
+        """Greedy global nearest-pair assignment, withholding conflicting ties.
+
+        Equal-cost disjoint pairs are safe. Ties sharing an AIQ row or UUID
+        leave the affected rows ambiguous and reserve their candidate UUIDs
+        from subsequent AIQ assignment. Unresolved rows depending on those
+        UUIDs are also ambiguous rather than falsely declared unmatched.
+        No identity fields break cost ties.
+        """
+        pairs = []
+        for index, transaction in enumerate(transactions):
+            transaction.uuid = None
+            transaction.match_method = MatchMethod.NONE
+            transaction.match_time_difference_seconds = None
+            transaction.transaction_match_status = TransactionMatchStatus.GROUND_TRUTH_ONLY
+            for _, difference, uuid, values, method in self._get_aiq_candidates(
+                transaction=transaction, container_logs_by_uuid=container_logs_by_uuid,
+                yard_id=yard_id,
+            ):
+                pairs.append((difference, index, uuid, values, method))
+
+        pairs.sort(key=lambda pair: pair[0])
+        resolved_rows: set[int] = set()
+        unavailable_uuids = set(used_container_log_uuids)
+        uncertain_uuids: set[str] = set()
+        offset = 0
+        while offset < len(pairs):
+            cost = pairs[offset][0]
+            end = offset + 1
+            while end < len(pairs) and isclose(pairs[end][0], cost, rel_tol=0.0, abs_tol=1e-6):
+                end += 1
+            group = [pair for pair in pairs[offset:end]
+                     if pair[1] not in resolved_rows
+                     and (pair[2] not in unavailable_uuids or pair[2] in uncertain_uuids)]
+            row_counts: dict[int, int] = {}
+            uuid_counts: dict[str, int] = {}
+            for _, index, uuid, _, _ in group:
+                row_counts[index] = row_counts.get(index, 0) + 1
+                uuid_counts[uuid] = uuid_counts.get(uuid, 0) + 1
+            ambiguous_rows = {
+                index for _, index, uuid, _, _ in group
+                if row_counts[index] > 1 or uuid_counts[uuid] > 1 or uuid in uncertain_uuids
+            }
+            for index in ambiguous_rows:
+                transaction = transactions[index]
+                transaction.transaction_match_status = TransactionMatchStatus.AMBIGUOUS
+                transaction.add_flag("AMBIGUOUS_AIQ_CONTAINER_LOG_MATCH")
+                resolved_rows.add(index)
+            for difference, index, uuid, values, method in group:
+                unavailable_uuids.add(uuid)
+                if index in ambiguous_rows:
+                    uncertain_uuids.add(uuid)
+                    continue
+                transaction = transactions[index]
+                transaction.uuid = values.uuid
+                self._attach_container_log_values(transaction=transaction, log_values=values)
+                transaction.transaction_match_status = TransactionMatchStatus.MATCHED
+                transaction.match_method = method
+                transaction.match_time_difference_seconds = difference
+                resolved_rows.add(index)
+                used_container_log_uuids.add(uuid)
+            offset = end
+
+        for transaction in transactions:
+            if transaction.transaction_match_status == TransactionMatchStatus.GROUND_TRUTH_ONLY:
+                transaction.add_flag("NO_CONTAINER_LOGS_MATCH_FOR_AIQ_TRANSACTION")
+        return list(transactions)
 
     # ------------------------------------------------------------------
     # Archive matching
@@ -301,11 +393,56 @@ class TransactionMatcher:
             float,
         ]
     ]:
+        candidates = self._find_time_candidates(
+            transaction=transaction,
+            container_logs_by_uuid=container_logs_by_uuid,
+        )
+
+        if not candidates:
+            return None
+
+        candidates.sort(
+            key=lambda item: (
+                item[0],
+                item[1],
+                item[2],
+            )
+        )
+
+        best_rank = candidates[0][0]
+        best_difference = candidates[0][1]
+
+        equally_good = [
+            candidate
+            for candidate in candidates
+            if (
+                candidate[0] == best_rank
+                and candidate[1] == best_difference
+            )
+        ]
+
+        if len(equally_good) > 1:
+            transaction.add_flag(
+                "AMBIGUOUS_ARCHIVE_CONTAINER_LOG_MATCH"
+            )
+
+        _, difference, uuid, values, method = candidates[0]
+
+        return uuid, values, method, difference
+
+    def _find_time_candidates(
+        self,
+        *,
+        transaction: UnifiedTransaction,
+        container_logs_by_uuid: dict[str, ContainerLogValues],
+        aiq_matching: bool = False,
+    ) -> list[tuple[int, float, str, ContainerLogValues, MatchMethod]]:
+        """Share time/direction checks; gate preference applies only to Archive."""
         if transaction.timestamp_utc is None:
             transaction.add_flag(
-                "ARCHIVE_TIMESTAMP_MISSING_FOR_MATCHING"
+                f"{transaction.ground_truth_source.value}_TIMESTAMP_MISSING_FOR_MATCHING"
             )
-            return None
+            return []
 
         ground_truth_timestamp = self._ensure_utc(
             transaction.timestamp_utc
@@ -376,9 +513,15 @@ class TransactionMatcher:
             )
 
             if (
-                self.config.require_direction_for_archive
+                (aiq_matching or self.config.require_direction_for_archive)
                 and not direction_matches
             ):
+                continue
+
+            if aiq_matching:
+                if not self._aiq_gate_identity_agrees(transaction, log_values):
+                    continue
+                candidates.append((0, difference, uuid, log_values, MatchMethod.TIMESTAMP_DIRECTION))
                 continue
 
             container_gate_values = {
@@ -426,37 +569,32 @@ class TransactionMatcher:
                 )
             )
 
-        if not candidates:
-            return None
+        return candidates
 
-        candidates.sort(
-            key=lambda item: (
-                item[0],
-                item[1],
-                item[2],
-            )
-        )
+    @staticmethod
+    def _normalize_remote_gate_id(value: object) -> Optional[str]:
+        cleaned = TransactionMatcher._clean_string(value)
+        if cleaned and cleaned.isascii() and cleaned.isdigit():
+            return str(int(cleaned))
+        return None
 
-        best_rank = candidates[0][0]
-        best_difference = candidates[0][1]
+    def _aiq_gate_identity_agrees(
+        self, transaction: UnifiedTransaction, values: ContainerLogValues,
+    ) -> bool:
+        """Validate independent comparable identities; missing data is allowed.
 
-        equally_good = [
-            candidate
-            for candidate in candidates
-            if (
-                candidate[0] == best_rank
-                and candidate[1] == best_difference
-            )
-        ]
-
-        if len(equally_good) > 1:
-            transaction.add_flag(
-                "AMBIGUOUS_ARCHIVE_CONTAINER_LOG_MATCH"
-            )
-
-        _, difference, uuid, values, method = candidates[0]
-
-        return uuid, values, method, difference
+        Legacy gate_ids and fusion_center_ids never validate or reject AIQ.
+        Both available comparisons must agree; neither influences cost rank.
+        """
+        name = self._normalize_gate(transaction.gate_name)
+        names = {normalized for value in values.gate_names
+                 if (normalized := self._normalize_gate(value))}
+        if name and names and name not in names:
+            return False
+        remote_id = self._normalize_remote_gate_id(transaction.gate_id)
+        remote_ids = {normalized for value in values.remote_gate_ids
+                      if (normalized := self._normalize_remote_gate_id(value))}
+        return not (remote_id and remote_ids and remote_id not in remote_ids)
 
     # ------------------------------------------------------------------
     # Container-log-only rows
@@ -540,6 +678,9 @@ class TransactionMatcher:
         transaction: UnifiedTransaction,
         log_values: ContainerLogValues,
     ) -> None:
+        transaction.container_logs_gate_names = list(log_values.gate_names)
+        transaction.container_logs_remote_gate_ids = list(log_values.remote_gate_ids)
+        transaction.container_logs_fusion_center_ids = list(log_values.fusion_center_ids)
         transaction.container_logs_truck_numbers = list(
             log_values.truck_numbers
         )
@@ -584,6 +725,9 @@ class TransactionMatcher:
             {},
         ).update(
             {
+                "gate_names": list(log_values.gate_names),
+                "remote_gate_ids": list(log_values.remote_gate_ids),
+                "fusion_center_ids": list(log_values.fusion_center_ids),
                 "directions": list(
                     log_values.directions
                 ),
