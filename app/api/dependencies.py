@@ -11,8 +11,8 @@ from app.matching.transaction_matcher import (
     TransactionMatcher,
     TransactionMatcherConfig,
 )
-from app.providers.aiq_sheets_provider import (
-    AIQSheetsProvider,
+from app.providers.aiq_database_provider import (
+    AIQDatabaseProvider,
 )
 from app.providers.archive_provider import (
     ArchiveProvider,
@@ -47,7 +47,7 @@ def get_application_services() -> ApplicationServices:
     """
     Construct and cache the unified analysis dependencies.
 
-    The Google Sheets data itself is still read during analysis requests.
+    AIQ data is queried directly from PostgreSQL during analysis requests.
     Caching here avoids rebuilding clients and parsers unnecessarily.
     """
 
@@ -72,15 +72,14 @@ def get_application_services() -> ApplicationServices:
     # Load timezone mappings during application initialization.
     timezone_service.refresh()
 
-    aiq_provider = AIQSheetsProvider(
-        spreadsheet_id=(
-            settings.aiq_spreadsheet_id
-        ),
-        worksheet_name=(
-            settings.aiq_worksheet_name
-        ),
-        credentials_file=(
-            settings.google_credentials_file
+    aiq_provider = AIQDatabaseProvider(
+        host=settings.aiq_db_host,
+        port=settings.aiq_db_port,
+        database=settings.aiq_db_name,
+        user=settings.aiq_db_user,
+        password=settings.aiq_db_password,
+        connect_timeout_seconds=(
+            settings.aiq_db_connect_timeout_seconds
         ),
         utc_to_local=(
             timezone_service.utc_to_local

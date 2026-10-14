@@ -45,7 +45,8 @@ class GroundTruthSelection:
     The transaction list may contain both AIQ and Archive transactions.
 
     AIQ remains the preferred source because TransactionMatcher processes
-    AIQ transactions first by UUID. Archive transactions are then matched
+    AIQ transactions first by yard, timestamp, and direction.
+    Archive transactions are then matched
     only against container-log UUIDs that AIQ did not consume.
     """
 
@@ -78,7 +79,7 @@ class GroundTruthSelector:
 
     TransactionMatcher applies the source priority:
 
-    - AIQ first, matched directly by UUID.
+    - AIQ first, matched by yard, timestamp, and direction.
     - Archive second, matched by timestamp, direction, and gate against
       container-log UUIDs not already used by AIQ.
     """
@@ -325,13 +326,12 @@ class GroundTruthSelector:
         end_utc: datetime,
     ) -> list[UnifiedTransaction]:
         """
-        Keep AIQ records that can participate in UUID matching.
+        Keep AIQ records that can participate in timestamp matching.
 
         Requirements:
 
         - matching yard ID;
-        - timestamp inside the requested UTC interval;
-        - non-empty UUID.
+        - timestamp inside the requested UTC interval.
         """
 
         eligible: list[
@@ -366,14 +366,6 @@ class GroundTruthSelector:
                 <= transaction_timestamp
                 < end_utc
             ):
-                continue
-
-            if not self._clean_string(
-                transaction.uuid
-            ):
-                transaction.add_flag(
-                    "AIQ_TRANSACTION_NOT_ELIGIBLE_FOR_UUID_MATCH"
-                )
                 continue
 
             transaction.ground_truth_source = (
@@ -684,7 +676,7 @@ class GroundTruthSelector:
     ) -> str:
         if aiq_count and archive_count:
             return (
-                "AIQ was loaded as the preferred UUID-based ground "
+                "AIQ was loaded as the preferred ground "
                 "truth, and Archive was retained for transactions not "
                 "covered by AIQ."
             )

@@ -10,7 +10,7 @@ app = FastAPI(
     title="Unified Transaction Analysis",
     description=(
         "Compares Alisa and container-log predictions against "
-        "AIQ Google Sheets data or Archive fallback ground truth."
+        "AIQ PostgreSQL data or Archive fallback ground truth."
     ),
     version="0.2.0",
 )

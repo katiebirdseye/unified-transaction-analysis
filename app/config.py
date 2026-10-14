@@ -271,48 +271,47 @@ class Settings:
 
     def validate_aiq(self) -> None:
         """
-        Validate configuration required for AIQ access through Fenix.
+        Validate configuration required for direct AIQ PostgreSQL access.
         """
 
         missing: list[str] = []
 
-        if not self.fenix_url:
+        if not self.aiq_db_host:
             missing.append(
-                "FENIX_URL"
+                "AIQ_DB_HOST"
             )
 
-        if not self.fenix_api_token:
+        if not self.aiq_db_name:
             missing.append(
-                "FENIX_API_TOKEN"
+                "AIQ_DB_NAME"
             )
 
-        if not self.aiq_spreadsheet_id:
+        if not self.aiq_db_user:
             missing.append(
-                "AIQ_SPREADSHEET_ID"
+                "AIQ_DB_USER"
             )
 
-        if not self.aiq_worksheet_name:
+        if not self.aiq_db_password:
             missing.append(
-                "AIQ_WORKSHEET_NAME"
+                "AIQ_DB_PASSWORD"
             )
 
-        if not self.aiq_database_name:
-            missing.append(
-                "AIQ_DATABASE_NAME"
+        if not 1 <= self.aiq_db_port <= 65535:
+            raise RuntimeError(
+                "AIQ_DB_PORT must be between 1 and 65535"
             )
 
-        if not self.google_credentials_file:
-            missing.append(
-                "GOOGLE_CREDENTIALS_FILE"
+        if self.aiq_db_connect_timeout_seconds <= 0:
+            raise RuntimeError(
+                "AIQ_DB_CONNECT_TIMEOUT_SECONDS "
+                "must be greater than zero"
             )
 
         if missing:
             raise RuntimeError(
-                "Missing Fenix AIQ configuration: "
+                "Missing AIQ PostgreSQL configuration: "
                 + ", ".join(missing)
             )
-
-        self._validate_credentials_file()
 
     def validate_archive(self) -> None:
         """

@@ -11,14 +11,20 @@ from fastapi import (
     Depends,
     HTTPException,
 )
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.dependencies import (
     ApplicationServices,
     get_application_services,
 )
 from app.config import settings
+from app.models.ticket_analysis import TicketAnalysisRequest
+from app.services.ticket_analysis import build_ticket_analysis
+from app.models.proof import ProofResponse
+from app.models.system_output import OutputProofResponse
+from app.services.system_output_serializer import extend_output_proof
+from app.services.proof_serializer import build_proof_response
 from app.exporters.dataframe_exporter import (
     DataFrameExporter,
 )
@@ -926,3 +932,86 @@ def export_transactions_csv(
                 f"{type(exc).__name__}: {exc}"
             ),
         ) from exc
+
+# The existing date-based /analyze and /export/csv contracts are preserved.
+class ProofAnalysisRequest(CSVExportRequest):
+    """Exact yard-local scope; accepts no ticket or inferred camera/gate fields."""
+    model_config = ConfigDict(extra='forbid')
+
+
+@router.post('/analyze/proof', response_model=ProofResponse)
+def analyze_transaction_proof(
+    payload: ProofAnalysisRequest,
+    services: ApplicationServices = Depends(get_application_services),
+):
+    return _analyze_transaction_proof(payload, services)
+
+
+def _analyze_transaction_proof(payload, services, *, output_provenance=False):
+    """Shared scope and acquisition for both explicit proof versions."""
+    try:
+        yard_id = _clean_yard_id(payload.yard_id)
+        start = _ensure_naive_local_datetime(payload.start_local, field_name='start_local')
+        end = _ensure_naive_local_datetime(payload.end_local, field_name='end_local')
+        if start >= end or end - start > timedelta(days=90):
+            raise ValueError('Local range must be increasing and no longer than 90 days.')
+        services.timezone_service.refresh()
+        yard = services.timezone_service.resolve_by_id(yard_id, refresh=False)
+        start_utc = services.timezone_service.local_to_utc(start, yard)
+        end_utc = services.timezone_service.local_to_utc(end, yard)
+        if start_utc.tzinfo is None or end_utc.tzinfo is None:
+            raise ValueError('Timezone service must return aware UTC boundaries.')
+        start_utc, end_utc = _ensure_utc_datetime(start_utc), _ensure_utc_datetime(end_utc)
+        if start_utc >= end_utc:
+            raise ValueError('Converted UTC range must be increasing.')
+        dates = _build_local_dates_for_range(start_local=start, end_local=end)
+    except YardNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except TimezoneServiceError as exc:
+        raise HTTPException(status_code=502, detail='Timezone resolution failed.') from exc
+
+    scope = dict(yard_id=yard.yard_id, start_local=start.isoformat(), end_local=end.isoformat(),
+        start_utc=start_utc.isoformat(), end_utc=end_utc.isoformat(), interval='[start,end)',
+        iana_timezone=None, timezone_config=dict(name=yard.timezone_name,
+            standard_utc_offset_hours=yard.standard_utc_offset_hours,
+            dst_utc_offset_hours=yard.dst_utc_offset_hours,
+            conversion='configured-offsets-north-american-dst'))
+    request = AnalysisRequest(yard_id=yard.yard_id, dates=dates, lookback_days=max(len(dates), 1),
+        include_container_logs_only=payload.include_container_logs_only,
+        normalized_ocr_deduplication=payload.normalized_ocr_deduplication)
+    try:
+        result = services.analysis_service.analyze(request)
+    except Exception:
+        logging.exception('Unified proof analysis failed')
+        # Do not disclose provider exception text (connection details/secrets).
+        proof = build_proof_response(request_scope=scope, failed=True)
+        if output_provenance:
+            proof = extend_output_proof(proof, [])
+        return JSONResponse(status_code=502, content=proof.model_dump(mode='json'))
+    exact = [transaction for transaction in result.transactions
+             if _transaction_is_in_utc_range(transaction, start_utc=start_utc, end_utc=end_utc)]
+    proof = build_proof_response(request_scope=scope, result=result, transactions=exact)
+    for candidate in proof.candidates:
+        candidate.timestamps.local['timezone'] = None
+        candidate.timestamps.local['timezone_config'] = scope['timezone_config']
+    return extend_output_proof(proof, exact, analysis_complete=result.decision_analysis_complete) if output_provenance else proof
+
+
+@router.post('/analyze/proof/v2', response_model=OutputProofResponse)
+def analyze_transaction_output_proof(
+    payload: ProofAnalysisRequest,
+    services: ApplicationServices = Depends(get_application_services),
+):
+    """Opt-in retained field provenance; v1 and CSV semantics remain unchanged."""
+    return _analyze_transaction_proof(payload, services, output_provenance=True)
+
+
+@router.post("/analyze/ticket")
+def analyze_ticket_transaction(
+    payload: TicketAnalysisRequest,
+    services: ApplicationServices = Depends(get_application_services),
+) -> dict:
+    """Locate by exact AIQ identity, then correlate using the source clock."""
+    return build_ticket_analysis(services.analysis_service, payload)
